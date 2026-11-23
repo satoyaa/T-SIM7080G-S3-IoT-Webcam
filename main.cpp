@@ -54,8 +54,8 @@ const char server[]   = "*****.*****.ts.net";
 const int  port       = 443;
 
 // --- 動作間隔の設定 (ms) ---
-const unsigned long CAPTURE_INTERVAL_MS = 10000; // 撮影・送信間隔 (10秒)
-const unsigned long POLLING_INTERVAL_MS = 10000; // サーバーポーリング間隔 (10秒)
+const unsigned long CAPTURE_INTERVAL_MS = 1000 * 60 * 60; // 撮影・送信間隔 (1h)
+const unsigned long POLLING_INTERVAL_MS = 10000; // サーバーポーリング間隔 (10s)
 
 // --- グローバルオブジェクト ---
 XPowersPMU PMU;
@@ -71,14 +71,18 @@ bool modem_ok  = false;
 bool is_streaming_requested = false;
 unsigned long last_capture_time = 0;
 unsigned long last_status_check_time = 0;
+unsigned long last_upload_attempt_time = 0;
+bool has_captured_image = false;
+bool has_attempted_upload = false;
+String pending_upload_path = "";
 
 String sendATCmd(String cmd, uint32_t timeout = 3000) {
   Serial.print("[AT Send] ");
   Serial.println(cmd);
-  
+
   while(SerialAT.available()) SerialAT.read();
   SerialAT.println(cmd);
-  
+
   String response = "";
   uint32_t start = millis();
   while (millis() - start < timeout) {
@@ -87,7 +91,7 @@ String sendATCmd(String cmd, uint32_t timeout = 3000) {
       response += c;
     }
   }
-  
+
   Serial.print("[AT Resp] ");
   Serial.println(response);
   return response;
@@ -99,18 +103,23 @@ void setOnboardLED(bool enable) {
   }
 }
 
-void saveJpgToSD(camera_fb_t *fb) {
-  if (!sd_ok || !fb) return;
+String saveJpgToSD(camera_fb_t *fb) {
+  if (!sd_ok || !fb) return "";
 
   String path = "/photo_" + String(millis()) + ".jpg";
   File file = SD_MMC.open(path.c_str(), FILE_WRITE);
   if (file) {
-    file.write(fb->buf, fb->len);
+    size_t written = file.write(fb->buf, fb->len);
     file.close();
-    Serial.printf("[SD Saved] %s (%u bytes)\n", path.c_str(), fb->len);
+    if (written == fb->len) {
+      Serial.printf("[SD Saved] %s (%u bytes)\n", path.c_str(), fb->len);
+      return path;
+    }
+    Serial.printf("[SD Error] Incomplete write to %s (%u/%u bytes)\n", path.c_str(), written, fb->len);
   } else {
     Serial.println("[SD Error] Failed to open file");
   }
+  return "";
 }
 
 bool checkServerStatus() {
@@ -141,12 +150,25 @@ bool checkServerStatus() {
   return (response.indexOf("\"stream\":true") != -1 || response.indexOf("\"stream\": true") != -1);
 }
 
-bool sendFrameToServer(camera_fb_t *fb) {
-  if (!modem_ok || !fb) return false;
+bool sendFileToServer(const String &path) {
+  if (!modem_ok || !sd_ok || path.isEmpty()) return false;
+
+  File file = SD_MMC.open(path.c_str(), FILE_READ);
+  if (!file) {
+    Serial.printf("[SD Error] Failed to open pending upload %s\n", path.c_str());
+    return false;
+  }
+  size_t file_size = file.size();
+  if (file_size == 0) {
+    file.close();
+    Serial.printf("[SD Error] Pending upload is empty: %s\n", path.c_str());
+    return false;
+  }
 
   Serial.println("[SSL Socket] Connecting for POST /upload...");
   if (!client.connect(server, port)) {
     Serial.println("[SSL Socket] Connection failed (POST)");
+    file.close();
     return false;
   }
 
@@ -154,20 +176,19 @@ bool sendFrameToServer(camera_fb_t *fb) {
                "Host: " + server + "\r\n" +
                "User-Agent: ESP32-SIM7080G\r\n" +
                "Content-Type: image/jpeg\r\n" +
-               "Content-Length: " + String(fb->len) + "\r\n" +
+               "Content-Length: " + String(file_size) + "\r\n" +
                "Connection: close\r\n\r\n");
 
-  Serial.printf("[SSL Socket] Sending JPEG (%u bytes) in 512B chunks...\n", fb->len);
-  size_t bytesLeft = fb->len;
-  uint8_t *bufPtr = fb->buf;
-  
-  while (bytesLeft > 0) {
-    size_t chunkSize = (bytesLeft > 512) ? 512 : bytesLeft;
-    client.write(bufPtr, chunkSize);
-    bufPtr += chunkSize;
-    bytesLeft -= chunkSize;
+  Serial.printf("[SSL Socket] Sending JPEG (%u bytes) in 512B chunks...\n", file_size);
+  uint8_t buffer[512];
+  size_t bytes_sent = 0;
+  while (file.available()) {
+    size_t bytes_read = file.read(buffer, sizeof(buffer));
+    if (bytes_read == 0 || client.write(buffer, bytes_read) != bytes_read) break;
+    bytes_sent += bytes_read;
     delay(10);
   }
+  file.close();
   Serial.println("[SSL Socket] Chunk upload complete.");
 
   unsigned long timeout = millis();
@@ -181,7 +202,8 @@ bool sendFrameToServer(camera_fb_t *fb) {
   }
   client.stop();
 
-  return (response.indexOf("\"stream\":true") != -1 || response.indexOf("\"stream\": true") != -1);
+  return bytes_sent == file_size &&
+         (response.indexOf("HTTP/1.1 2") != -1 || response.indexOf("HTTP/1.0 2") != -1);
 }
 
 void setup() {
@@ -309,24 +331,37 @@ void loop() {
   unsigned long current_time = millis();
 
   // 【10秒毎】静止画撮影 ＋ SD保存 ＋ (要求があれば) ストリーム送信
-  if (camera_ok && (current_time - last_capture_time >= CAPTURE_INTERVAL_MS)) {
-    last_capture_time = current_time;
-
+  if (camera_ok && (!has_captured_image || current_time - last_capture_time >= CAPTURE_INTERVAL_MS)) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) {
+      last_capture_time = current_time;
+      has_captured_image = true;
       // 1. SDカード保存
-      saveJpgToSD(fb);
-
-      // 2. ストリーミング要求があれば送信
-      if (is_streaming_requested) {
-        setOnboardLED(true);
-        Serial.println("[Stream] Uploading frame to server...");
-        is_streaming_requested = sendFrameToServer(fb);
-        setOnboardLED(false);
+      String saved_path = saveJpgToSD(fb);
+      if (!saved_path.isEmpty()) {
+        pending_upload_path = saved_path;
+        Serial.printf("[Upload] Latest image queued: %s\n", pending_upload_path.c_str());
+      } else {
+        Serial.println("[Upload] Image was not queued because SD save failed.");
       }
 
+      // 2. ストリーミング要求があれば送信
       esp_camera_fb_return(fb);
     }
+  }
+
+  if (!pending_upload_path.isEmpty() &&
+      (!has_attempted_upload || current_time - last_upload_attempt_time >= POLLING_INTERVAL_MS)) {
+    last_upload_attempt_time = current_time;
+    has_attempted_upload = true;
+    setOnboardLED(true);
+    if (sendFileToServer(pending_upload_path)) {
+      Serial.printf("[Upload] Sent successfully: %s\n", pending_upload_path.c_str());
+      pending_upload_path = "";
+    } else {
+      Serial.printf("[Upload] Failed; will retry latest image: %s\n", pending_upload_path.c_str());
+    }
+    setOnboardLED(false);
   }
 
   // 【10秒毎】ストリーミング停止中のみ、視聴リクエストの有無をチェック
